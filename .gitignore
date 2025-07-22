@@ -1,0 +1,9 @@
+venv/
+.env
+.env.*
+.DS_Store
+__pycache__/
+*.pyc
+*.log
+product_agent_index/
+*.pdf

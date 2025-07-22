@@ -1,0 +1,131 @@
+import sys
+import json
+import re
+from .shared import vectorstore, query_llm
+from Agent.agent1_module import ProductDetailAgent
+
+class Agent2:
+    def __init__(self, community_id):
+        self.community_id = community_id.strip()
+        self.context = self.get_relevant_context()
+
+    def get_relevant_context(self, top_k=5) -> str:
+        results = vectorstore.similarity_search(self.community_id, k=top_k)
+        return "\n".join([doc.page_content for doc in results if doc.page_content])
+
+    def extract_discount_info(self, subsidy_level=None):
+        prompt = f"""
+        You are a smart assistant. From the table or data below, extract the discount per kg for a given community ID and subsidy level.
+
+        The data is structured with the format:
+        Community Name Community ID High Medium Low Seasonal
+
+        Please perform an exact match on the Community ID, and return the value from the correct subsidy level column.
+
+        Always respond in valid JSON like:
+        {{
+        "community_id": "...",
+        "discount_per_kg": "..."
+        }}
+
+        Strictly follow these examples:
+
+        Example 1:
+        Input:
+        community_id = "ON-NON-ATT"
+        subsidy_level = "Medium"
+        Table:
+        Attawapiskat ON-NON-ATT 3.10 2.90 1.40 1.10
+
+        Output:
+        {{
+        "community_id": "ON-NON-ATT",
+        "discount_per_kg": "2.90"
+        }}
+
+        Example 2:
+        Input:
+        community_id = "MB-NMB-BRO"
+        subsidy_level = "Low"
+        Table:
+        Brochet MB-NMB-BRO 3.10 2.90 1.40 1.10
+
+        Output:
+        {{
+        "community_id": "MB-NMB-BRO",
+        "discount_per_kg": "1.40"
+        }}
+
+        Example 3:
+        Input:
+        community_id = "AB-NAB-FCH"
+        subsidy_level = "High"
+        Table:
+        Brochet MB-NMB-BRO 3.10 2.90 1.40 1.10
+
+        Output:
+        {{
+        "community_id": "AB-NAB-FCH",
+        "discount_per_kg": "3.10"
+        }}
+        Now, complete the following:
+
+        Input:
+        community_id = "{self.community_id}"
+        subsidy_level = "{subsidy_level}"
+
+        Table:
+        {self.context}
+        """
+        result = query_llm(prompt)
+        try:
+            json_str = re.search(r'\{.*\}', result, re.DOTALL).group()
+            return json.loads(json_str)
+        except Exception as e:
+            print("Failed to extract JSON:", e)
+            return {
+                "community_id": self.community_id,
+                "discount_per_kg": "Not found"
+            }
+
+    def run(self, product_info):
+        subsidy_level = product_info.get("subsidy_level")
+        discount_info = self.extract_discount_info(subsidy_level=subsidy_level)
+        final_info = {
+            **product_info,
+            "community_id": self.community_id,
+            "discount_per_kg": discount_info.get("discount_per_kg", "Not found")
+        }
+        print("\nAgent2 is working:", final_info)
+        return final_info
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        print("Usage: python -m Agent.Agent2 <community_id> <product_name1> [<product_name2> ...]")
+        sys.exit(1)
+
+    community_id = sys.argv[1].strip()
+    product_names = sys.argv[2:]
+
+    agent1 = ProductDetailAgent()
+    agent2 = Agent2(community_id)
+
+    results = []
+
+    for i, product_name in enumerate(product_names):
+        print(f"\nProcessing Product {i+1}: {product_name}")
+
+        product_state = agent1.extract_product_details(product_name)
+        print("Agent1 is working:")
+        print(product_state)
+
+        if not product_state.get("subsidy_level"):
+            print("⚠️  Could not determine subsidy level. Skipping.")
+            continue
+
+        result = agent2.run(product_state)
+        results.append(result)
+
+    print("\nFinal Results Summary:")
+    for r in results:
+        print(json.dumps(r, indent=2))
