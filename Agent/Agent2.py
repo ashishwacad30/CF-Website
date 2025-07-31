@@ -9,9 +9,20 @@ class Agent2:
         self.community_id = community_id.strip()
         self.context = self.get_relevant_context()
 
-    def get_relevant_context(self, top_k=5) -> str:
+    # def get_relevant_context(self, top_k=5) -> str:
+    #     results = vectorstore.similarity_search(self.community_id, k=top_k)
+    #     return "\n".join([doc.page_content for doc in results if doc.page_content])
+    
+    def get_relevant_context(self, top_k=50, max_words=2500) -> str:
         results = vectorstore.similarity_search(self.community_id, k=top_k)
-        return "\n".join([doc.page_content for doc in results if doc.page_content])
+        combined = "\n".join([doc.page_content for doc in results if doc.page_content])
+
+    # Truncate to max words (~token count)
+        words = combined.split()
+        if len(words) > max_words:
+            combined = " ".join(words[:max_words])
+
+        return combined
 
     def extract_discount_info(self, subsidy_level=None):
         prompt = f"""

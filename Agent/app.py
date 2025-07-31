@@ -15,7 +15,7 @@ if "product_inputs" not in st.session_state:
 def add_product_input():
     st.session_state.product_inputs.append("")
 
-st.header("📝 Input Section")
+st.header("Input Section")
 
 community_id = st.text_input("Enter Community ID", key="community_id_input")
 

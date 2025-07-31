@@ -1,3 +1,4 @@
+
 import re
 import json
 from typing import Optional, TypedDict
@@ -27,6 +28,11 @@ class ProductDetailAgent:
         return None
 
     def extract_product_details(self, product_name: str) -> ProductState:
+        def clean_product_name(name: str) -> str:
+            name = re.sub(r'\b(SINGLE|TWIN|PACK|BOX|BAG|KG|G|ML|L)\b', '', name, flags=re.IGNORECASE)
+            name = re.sub(r'[,&/()-]', ' ', name)
+            return name.strip().lower()
+
         state: ProductState = {
             "product_name": product_name,
             "product_code": None,
@@ -34,25 +40,32 @@ class ProductDetailAgent:
         }
 
         chunks = list(self.vectorstore.docstore._dict.values())
-        matched_chunk = self.find_best_matching_chunk(product_name, chunks)
+        valid_codes = {
+            doc.metadata.get("product_code")
+            for doc in chunks if doc.metadata.get("product_code")
+        }
 
+        cleaned_name = clean_product_name(product_name)
+        matched_chunk = self.find_best_matching_chunk(cleaned_name, chunks)
+
+        text_to_use = matched_chunk if matched_chunk else ""
+        best_line = None
         if matched_chunk:
-            best_line = None
-            lines = matched_chunk.split('\n')
-            for line in lines:
-                if product_name.lower() in line.lower():  # ← improved match
+            for line in matched_chunk.split('\n'):
+                if cleaned_name in line.lower():
                     best_line = line
                     break
+            if best_line:
+                text_to_use = best_line
 
-            text_to_use = best_line if best_line else matched_chunk
-
-            product_code_match = re.search(r'\b\d-[A-Z]\d{2}\b', text_to_use)
-            if product_code_match:
-                product_code = product_code_match.group(0)
+        # Regex match
+        product_code_match = re.search(r'\b\d-[A-Z]\d{2}\b', text_to_use)
+        if product_code_match:
+            product_code = product_code_match.group(0)
+            if product_code in valid_codes:
                 state["product_code"] = product_code
-
                 first_digit = product_code.split("-")[0]
-                subsidy = {
+                state["subsidy_level"] = {
                     "7": "High",
                     "1": "Medium",
                     "2": "Low",
@@ -62,96 +75,127 @@ class ProductDetailAgent:
                     "8": "Seasonal Surface"
                 }.get(first_digit, None)
 
-                state["subsidy_level"] = subsidy
-            else:
-                # 👇 fallback to LLM using product name + reference
-                product_description = product_name
-                combined_reference = "\n\n".join(doc.page_content for doc in chunks[:20])  # Top N chunks
+        if not state["product_code"]:
+            product_description = product_name
+            relevant_chunks = self.vectorstore.similarity_search(product_description, k=30)
 
-                prompt = f"""
-You are a subsidy extraction assistant for Nutrition North Canada (NNC). 
-Your task is to analyze a product description, match it to a category in the provided NNC reference document, and extract the corresponding product code and subsidy level. 
-You should use your knowledge and the NNC reference document to find the closest matching category for the user's product. Even if the product isn't explicitly listed, use common examples and your understanding of category-product relationships to make the best match. 
-You will be provided with a product description and an NNC reference document.
+            reference_text = "\n\n".join(doc.page_content for doc in relevant_chunks)
 
-Product Description: {product_description}
+            seen = set()
+            category_hints = ""
+            for doc in relevant_chunks:
+                category = doc.metadata.get("category")
+                code = doc.metadata.get("product_code")
+                if not category or not code:
+                    continue
+                key = (category, code)
+                if key not in seen:
+                    category_hints += f"- {category} → Code: {code}\n"
+                    seen.add(key)
 
-NNC Reference Document: {combined_reference}
+            prompt = f"""
+            You are a subsidy extraction assistant for Nutrition North Canada (NNC). 
+            Your task is to analyze a product description, match it to a category in the provided NNC reference document, and extract the corresponding product code and subsidy level. 
+            You should use your knowledge and the NNC reference document to find the closest matching category for the user's product. Even if the product isn't explicitly listed, use common examples and your understanding of category-product relationships to make the best match. 
+            You will be provided with a product description and an NNC reference document.
 
-Follow these steps:
+            Product Description: {product_description}
 
-1.  Carefully analyze the product description.
-2.  Review the NNC reference document to understand the different product categories and their associated product codes and subsidy levels.
-3.  Use your knowledge and the NNC reference document to find the closest matching category for the user's product. Even if the product isn't explicitly listed, use common examples and your understanding of category-product relationships to make the best match.
-    *   For example, the reference document lists "Bread products" (1-B04). Use your knowledge to understand that products like bagels, English muffins, bread rolls, raisin bread, hamburger buns, hot dog buns, pizza crusts, and frozen bread dough also fall under the "Bread products" category.
-4.  Extract the product code and subsidy level for the matched category.
-5.  Output the product code and subsidy level in the following JSON format:
+            NNC Reference Document: {reference_text}
 
-Expected Output Format:
-{{
-"product_code": "<NNC ID or null>",
-"subsidy_level": "<High/Medium/Low/Country Food/Seasonal Surface or null>"
-}}
 
-Here are the rules for determining the subsidy level:
+            Follow these steps:
 
-*   7 → High  
-*   1 → Medium  
-*   2, 3, 4 → Low  
-*   5 → Country Food  
-*   8 → Seasonal Surface  
+            1.  Carefully analyze the product description.
+            2.  Review the NNC reference document to understand the different product categories and their associated product codes and subsidy levels.
+            3.  Use your knowledge and the NNC reference document to find the closest matching category for the user's product. Even if the product isn't explicitly listed, use common examples and your understanding of category-product relationships to make the best match.
+                *   For example, the reference document lists "Bread products" (1-B04). Use your knowledge to understand that products like bagels, English muffins, bread rolls, raisin bread, hamburger buns, hot dog buns, pizza crusts, and frozen bread dough also fall under the "Bread products" category.
+            4.  Extract the product code and subsidy level for the matched category.
+            5.  Output the product code and subsidy level in the following JSON format:
 
-Here are some examples:
+            Expected Output Format:
+            {{
+            "product_code": "<NNC ID or null>",
+            "subsidy_level": "<High/Medium/Low/Country Food/Seasonal Surface or null>"
+            }}
 
-Example 1:
-Input:
-product name = "Frozen vegetables"
+            Here are the rules for determining the subsidy level:
 
-Output:
-{{
-"product_code": "7-A01",
-"subsidy_level": "High"
-}}
+            *   7 → High  
+            *   1 → Medium  
+            *   2, 3, 4 → Low  
+            *   5 → Country Food  
+            *   8 → Seasonal Surface  
 
-Example 2:
-Input:
-product name = "Butter"
+            Here are some examples:
 
-Output:
-{{
-"product_code": "1-A01",
-"subsidy_level": "Medium"
-}}
+            Example 1:
+            Input:
+            product name = "Frozen vegetables"
 
-Example 3:
-Input:
-product name = "Fresh salmon"
+            Output:
+            {{
+            "product_code": "7-A01",
+            "subsidy_level": "High"
+            }}
 
-Output:
-{{
-"product_code": "5-C02",
-"subsidy_level": "Country Food"
-}}
+            Example 2:
+            Input:
+            product name = "Butter"
 
-If you cannot find a matching category or the product description is unclear, output:
-{{
-"product_code": null,
-"subsidy_level": null
-}}
-                """
+            Output:
+            {{
+            "product_code": "1-A01",
+            "subsidy_level": "Medium"
+            }}
+
+            Example 3:
+            Input:
+            product name = "Fresh salmon"
+
+            Output:
+            {{
+            "product_code": "5-C02",
+            "subsidy_level": "Country Food"
+            }}
+
+            If you cannot find a matching category or the product description is unclear, output:
+            {{
+            "product_code": null,
+            "subsidy_level": null
+            }}
+            """
+
+            try:
+                print("[DEBUG] Sending prompt to LLM...")
                 response = self.llm.invoke(prompt)
                 raw_text = response.content if hasattr(response, "content") else str(response)
+                json_match = re.search(r"\{.*?\}", raw_text, re.DOTALL)
+                parsed = json.loads(json_match.group(0)) if json_match else {}
 
-                try:
-                    json_match = re.search(r"\{[^{}]*\}", raw_text, re.DOTALL)
-                    json_str = json_match.group(0) if json_match else "{}"
-                    parsed = json.loads(json_str)
-
-                    state["product_code"] = parsed.get("product_code")
+                code_from_llm = parsed.get("product_code")
+                if code_from_llm in valid_codes:
+                    state["product_code"] = code_from_llm
                     state["subsidy_level"] = parsed.get("subsidy_level")
-                except Exception as e:
-                    print(f"Failed to extract JSON: {e}")
-        else:
-            print(f"No matching chunk found for: {product_name}")
+                else:
+                    print(f"LLM returned invalid or unrecognized code: {code_from_llm}. Ignored.")
+            except Exception as e:
+                print(f"Failed to extract JSON from LLM: {e}")
+
+        if state["product_code"] and not state["subsidy_level"]:
+            first_digit = state["product_code"].split("-")[0]
+            state["subsidy_level"] = {
+                "7": "High",
+                "1": "Medium",
+                "2": "Low",
+                "3": "Low",
+                "4": "Low",
+                "5": "Country Food",
+                "8": "Seasonal Surface"
+            }.get(first_digit, None)
+
+        if not state["product_code"]:
+            print(f"Could not determine product code for: {product_name}")
 
         return state
+

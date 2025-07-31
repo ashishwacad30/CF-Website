@@ -25,3 +25,5 @@ def get_pdf_text(pdf_path: str) -> str:
 def query_llm(prompt: str) -> str:
     response = llm.invoke(prompt)
     return response.content.strip()
+
+
