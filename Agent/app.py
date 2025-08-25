@@ -54,4 +54,4 @@ if st.button("Calculate Subsidies"):
             )
 
 st.markdown("---")
-st.caption("Built with ❤️ using Streamlit.")
+st.caption("Built with using Streamlit.")

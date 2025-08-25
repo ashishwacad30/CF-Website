@@ -130,18 +130,38 @@ import os
 import re
 import boto3
 from io import BytesIO
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from PyPDF2 import PdfReader
 from tempfile import NamedTemporaryFile
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_huggingface import HuggingFaceEmbeddings  # updated import
 from langchain.docstore.document import Document
+from weaviate.auth import AuthApiKey
+from weaviate import Client as V3Client
 
-load_dotenv(dotenv_path=".env")
+"""Vector ingestion utilities for PDF content into Weaviate.
+
+This module extracts semantically meaningful chunks from a PDF, augments them
+with recursive text splitting, embeds with a HuggingFace model, and ingests the
+vectors and metadata into a Weaviate cluster.
+"""
+
+load_dotenv(find_dotenv())
 
 def extract_semantic_chunks_with_metadata(pdf_stream):
+    """Parse a PDF stream into category/code-aware text chunks.
+
+    The function walks each page, identifies lines that start a product
+    category/code block, and accumulates lines until the next block. It outputs
+    `Document` objects with `page`, `product_code`, and `category` metadata.
+
+    Args:
+        pdf_stream: A binary stream positioned at the start of a PDF file.
+
+    Returns:
+        A list of `langchain.docstore.document.Document` instances.
+    """
     reader = PdfReader(pdf_stream)
     chunks = []
 
@@ -183,68 +203,98 @@ def extract_semantic_chunks_with_metadata(pdf_stream):
 
     return chunks
 
-def embeddings_exist(base_name):
-    return os.path.exists(base_name)
-
 def generate_vectorstore():
+    """Create embeddings for PDF content and ingest into Weaviate.
+
+    - Downloads a PDF from S3 specified by environment variables `BUCKET_NAME`
+      and `OBJECT_KEY`.
+    - Extracts semantic and recursively split chunks.
+    - Embeds chunk texts using `sentence-transformers/all-mpnet-base-v2`.
+    - Ensures the Weaviate class exists and batches ingestion with attached
+      vectors.
+    """
     bucket_name = os.getenv("BUCKET_NAME")
     object_key = os.getenv("OBJECT_KEY")
     print("Loaded OBJECT_KEY:", object_key)
 
-    base_name = "product_agent_index"  # Consistent folder name for saving/loading
-
-    if embeddings_exist(base_name):
-        print(f"Embeddings already exist for: {base_name}. Skipping generation.")
-        return
-
-    os.makedirs(base_name, exist_ok=True)
-
-    # Download PDF from S3
     s3 = boto3.client("s3")
     pdf_stream = BytesIO()
     s3.download_fileobj(bucket_name, object_key, pdf_stream)
     pdf_stream.seek(0)
 
-    # Save PDF temporarily for PyPDFLoader
     with NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
         tmp_pdf.write(pdf_stream.read())
         tmp_pdf_path = tmp_pdf.name
 
     pdf_stream.seek(0)
 
-    # Load PDF pages with LangChain loader
     pdf_loader = PyPDFLoader(file_path=tmp_pdf_path)
     pdf_pages = pdf_loader.load()
     print(f"Loaded {len(pdf_pages)} PDF pages")
 
-    # Extract semantic chunks with metadata
     semantic_chunks = extract_semantic_chunks_with_metadata(pdf_stream)
 
-    # Use RecursiveCharacterTextSplitter for recursive chunks
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
     recursive_chunks = splitter.split_documents(pdf_pages)
 
-    # Add metadata to recursive chunks
     for i, doc in enumerate(recursive_chunks):
         doc.metadata = {**doc.metadata, "source": "recursive", "recursive_idx": i}
 
-    # Combine chunks
     chunks = semantic_chunks + recursive_chunks
-
     if not chunks:
         raise ValueError("No extractable content found in PDF.")
-
     print(f"Total Chunks: {len(chunks)}")
 
-    # Initialize embedding model
-    embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
 
-    # Create vectorstore from documents
-    vectorstore = FAISS.from_documents(chunks, embedding_model)
+    weaviate_host = os.getenv("WEAVIATE_HOST", "http://localhost:8080")
+    weaviate_api_key = os.getenv("WEAVIATE_API_KEY") or None
+    class_name = os.getenv("WEAVIATE_CLASS_NAME", "ProductChunk")
 
-    # Save vectorstore locally in the base_name folder
-    vectorstore.save_local(base_name)
-    print(f"Vectorstore saved as '{base_name}'")
+    if weaviate_api_key:
+        client = V3Client(url=weaviate_host, auth_client_secret=AuthApiKey(weaviate_api_key))
+    else:
+        client = V3Client(url=weaviate_host)
 
+    try:
+        schema = client.schema.get()
+        existing_classes = {c.get('class') for c in schema.get('classes', [])}
+        if class_name not in existing_classes:
+            class_obj = {
+                "class": class_name,
+                "vectorizer": "none",
+                "properties": [
+                    {"name": "text", "dataType": ["text"]},
+                    {"name": "page", "dataType": ["int"]},
+                    {"name": "product_code", "dataType": ["text"]},
+                    {"name": "category", "dataType": ["text"]},
+                    {"name": "source", "dataType": ["text"]},
+                    {"name": "recursive_idx", "dataType": ["int"]},
+                ],
+            }
+            client.schema.create_class(class_obj)
+            print(f"Created Weaviate class: {class_name}")
+    except Exception as schema_err:
+        print(f"Weaviate schema ensure error: {schema_err}")
+
+    texts = [doc.page_content for doc in chunks]
+    metadatas = [doc.metadata for doc in chunks]
+
+    vectors = embedding_model.embed_documents(texts)
+
+    client.batch.configure(batch_size=64)
+    with client.batch as batch:
+        for content, metadata, vector in zip(texts, metadatas, vectors):
+            props = {
+                "text": content,
+                "page": int(metadata.get("page") or 0),
+                "product_code": metadata.get("product_code"),
+                "category": metadata.get("category"),
+                "source": metadata.get("source", "recursive"),
+                "recursive_idx": int(metadata.get("recursive_idx") or 0),
+            }
+            batch.add_data_object(data_object=props, class_name=class_name, vector=vector)
+
+    print(f"Ingested {len(texts)} chunks into Weaviate class '{class_name}'")
 if __name__ == "__main__":
     generate_vectorstore()

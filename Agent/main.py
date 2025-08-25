@@ -1,58 +1,68 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List
+from pydantic import BaseModel, RootModel
+from typing import List, Dict
 from Agent.agent1_module import ProductDetailAgent
 from Agent.Agent2 import Agent2
+from Agent.tasks import process_products_task
 from Agent.validation import validate_and_trigger_agents
 
 app = FastAPI()
-
 class LocationRequest(BaseModel):
     address: str
     community_name: str
 
-class PredictionRequest(BaseModel):
-    community_id: str
-    product_names: List[str]
+class ProductItem(RootModel[Dict[str, str]]):
+    pass
 
-class PredictionResponse(BaseModel):
-    product_name: str
-    product_code: str
-    subsidy_level: str
+class PredictionRequest(BaseModel):
+    order_id: str
     community_id: str
-    discount_per_kg: str
+    product_names: List[ProductItem]
+
+def format_response(order_id: str, community_id: str, raw_products: List[dict], order_item_ids: List[str]) -> dict:
+    formatted_products = []
+    for product, order_item_id in zip(raw_products, order_item_ids):
+        # Rename discount_per_kg to subsidy_value if present
+        subsidy_value = product.get("discount_per_kg") or product.get("subsidy_value")
+        formatted_products.append({
+            "product_name": product.get("product_name"),
+            "product_code": product.get("product_code"),
+            "subsidy_level": product.get("subsidy_level"),
+            "community_id": community_id,
+            "subsidy_value": subsidy_value,
+            "order_item_id": order_item_id,
+        })
+    return {
+        "order_id": order_id,
+        "products": formatted_products
+    }
 
 @app.post("/predict")
-def predict(request: PredictionRequest) -> List[dict]:
-    agent1 = ProductDetailAgent()
-    agent2 = Agent2(request.community_id.strip())
-    results = []
+def predict(request: PredictionRequest) -> dict:
+    order_item_ids: List[str] = []
+    product_names: List[str] = []
+    for item in request.product_names:
+        order_item_id, product_name_str = list(item.root.items())[0]
+        order_item_ids.append(order_item_id)
+        product_names.append(product_name_str)
 
-    for i, product_name in enumerate(request.product_names):
-        print(f"\nProcessing Product {i+1}: {product_name}")
+    async_result = process_products_task.delay(request.community_id, product_names)
 
-        product_state = agent1.extract_product_details(product_name)
-        print("Agent1 is working:")
-        print(product_state)
-
-        if not product_state.get("subsidy_level"):
-            print("Could not determine subsidy level. Skipping.")
-            continue
-
-        result = agent2.run(product_state)
-        results.append(result)
+    try:
+        results: List[dict] = async_result.get(timeout=300)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Batch processing failed: {e}")
 
     if not results:
         raise HTTPException(status_code=404, detail="No valid results generated.")
 
-    return results
+    return format_response(request.order_id, request.community_id, results, order_item_ids)
 
 @app.post("/validate-address/")
 def validate_address_endpoint(payload: LocationRequest):
     try:
         delivery_address = payload.address
         input_community_name = payload.community_name
-
         result = validate_and_trigger_agents(delivery_address, input_community_name)
 
         if result["status"] == "failed":

@@ -1,19 +1,42 @@
+
+
 import sys
 import json
 import re
 from .shared import vectorstore, query_llm
 from Agent.agent1_module import ProductDetailAgent
 
+"""Agent 2: Community subsidy lookup and aggregation.This module defines `Agent2`, which retrieves context for a given community ID
+from a vector store, prompts an LLM to extract the discount per kg for a specified subsidy level, and combines that with product info produced by
+`ProductDetailAgent`."""
 class Agent2:
+    """Agent that extracts discount information for a community.
+
+    Given a `community_id`, the agent retrieves relevant context from the
+    vector store and queries an LLM to extract the discount per kg for a
+    specific subsidy level.
+    """
     def __init__(self, community_id):
+        """Initialize with a community identifier and prefetch context.
+
+        Args:
+            community_id: Community identifier string used for retrieval and
+                table row matching in the LLM prompt.
+        """
         self.community_id = community_id.strip()
         self.context = self.get_relevant_context()
 
-    # def get_relevant_context(self, top_k=5) -> str:
-    #     results = vectorstore.similarity_search(self.community_id, k=top_k)
-    #     return "\n".join([doc.page_content for doc in results if doc.page_content])
-    
-    def get_relevant_context(self, top_k=50, max_words=2500) -> str:
+    def get_relevant_context(self, top_k=20, max_words=2500) -> str:
+        """Retrieve concatenated text context for the community.
+
+        Args:
+            top_k: Number of similar documents to retrieve from the store.
+            max_words: Maximum word count to keep after concatenation.
+
+        Returns:
+            A single string containing the top-k results truncated to
+            `max_words`, used as the table context in prompts.
+        """
         results = vectorstore.similarity_search(self.community_id, k=top_k)
         combined = "\n".join([doc.page_content for doc in results if doc.page_content])
 
@@ -25,6 +48,19 @@ class Agent2:
         return combined
 
     def extract_discount_info(self, subsidy_level=None):
+        """Ask the LLM to extract discount per kg for the given subsidy level.
+
+        The prompt instructs the model to perform an exact match on the
+        `community_id` and return a small JSON object with `discount_per_kg`.
+
+        Args:
+            subsidy_level: One of the recognized subsidy levels (e.g., High,
+                Medium, Low, Seasonal). Can be None; the prompt still executes
+                but may return "Not found".
+
+        Returns:
+            A dict with keys `community_id` and `discount_per_kg`.
+        """
         prompt = f"""
         You are a smart assistant. From the table or data below, extract the discount per kg for a given community ID and subsidy level.
 
@@ -100,6 +136,16 @@ class Agent2:
             }
 
     def run(self, product_info):
+        """Combine product info with community discount information.
+
+        Args:
+            product_info: Dict-like mapping from `ProductDetailAgent` including
+                at least `subsidy_level`.
+
+        Returns:
+            A dict merging product info with `community_id` and
+            `discount_per_kg` extracted for that subsidy level.
+        """
         subsidy_level = product_info.get("subsidy_level")
         discount_info = self.extract_discount_info(subsidy_level=subsidy_level)
         final_info = {
@@ -131,7 +177,7 @@ if __name__ == "__main__":
         print(product_state)
 
         if not product_state.get("subsidy_level"):
-            print("⚠️  Could not determine subsidy level. Skipping.")
+            print("Could not determine subsidy level. Skipping.")
             continue
 
         result = agent2.run(product_state)
