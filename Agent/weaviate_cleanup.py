@@ -5,12 +5,10 @@ from dotenv import load_dotenv, find_dotenv
 from weaviate import Client as V3Client  # v3 client
 from weaviate.auth import AuthApiKey
 
-
 def connect_v3(url: str, api_key: str | None) -> V3Client:
     if api_key:
         return V3Client(url=url, auth_client_secret=AuthApiKey(api_key))
     return V3Client(url=url)
-
 
 def class_exists(client: V3Client, class_name: str) -> bool:
     try:
@@ -19,11 +17,9 @@ def class_exists(client: V3Client, class_name: str) -> bool:
     except Exception:
         return False
 
-
 def drop_class(client: V3Client, class_name: str) -> None:
     if class_exists(client, class_name):
         client.schema.delete_class(class_name)
-
 
 def recreate_class(client: V3Client, class_name: str) -> None:
     client.schema.create_class({

@@ -1,14 +1,13 @@
-
-
 import sys
 import json
 import re
-from .shared import vectorstore, query_llm
-from Agent.agent1_module import ProductDetailAgent
+from shared import vectorstore, query_llm
+from agent1_module import ProductDetailAgent
 
 """Agent 2: Community subsidy lookup and aggregation.This module defines `Agent2`, which retrieves context for a given community ID
 from a vector store, prompts an LLM to extract the discount per kg for a specified subsidy level, and combines that with product info produced by
 `ProductDetailAgent`."""
+
 class Agent2:
     """Agent that extracts discount information for a community.
 
@@ -18,7 +17,6 @@ class Agent2:
     """
     def __init__(self, community_id):
         """Initialize with a community identifier and prefetch context.
-
         Args:
             community_id: Community identifier string used for retrieval and
                 table row matching in the LLM prompt.
@@ -28,7 +26,6 @@ class Agent2:
 
     def get_relevant_context(self, top_k=20, max_words=2500) -> str:
         """Retrieve concatenated text context for the community.
-
         Args:
             top_k: Number of similar documents to retrieve from the store.
             max_words: Maximum word count to keep after concatenation.
@@ -40,7 +37,6 @@ class Agent2:
         results = vectorstore.similarity_search(self.community_id, k=top_k)
         combined = "\n".join([doc.page_content for doc in results if doc.page_content])
 
-    # Truncate to max words (~token count)
         words = combined.split()
         if len(words) > max_words:
             combined = " ".join(words[:max_words])
@@ -61,19 +57,20 @@ class Agent2:
         Returns:
             A dict with keys `community_id` and `discount_per_kg`.
         """
+        
         prompt = f"""
         You are a smart assistant. From the table or data below, extract the discount per kg for a given community ID and subsidy level.
 
         The data is structured with the format:
         Community Name Community ID High Medium Low Seasonal
 
-        Please perform an exact match on the Community ID, and return the value from the correct subsidy level column.
+        Strictly perform an exact match on the Community ID, and return the value from the correct subsidy level column.
 
         Always respond in valid JSON like:
         {{
         "community_id": "...",
         "discount_per_kg": "..."
-        }}
+        }}  
 
         Strictly follow these examples:
 
@@ -132,7 +129,7 @@ class Agent2:
             print("Failed to extract JSON:", e)
             return {
                 "community_id": self.community_id,
-                "discount_per_kg": "Not found"
+                "discount_per_kg": "None"
             }
 
     def run(self, product_info):

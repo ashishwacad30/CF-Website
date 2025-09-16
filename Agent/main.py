@@ -1,10 +1,10 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, RootModel
 from typing import List, Dict
-from Agent.agent1_module import ProductDetailAgent
-from Agent.Agent2 import Agent2
-from Agent.tasks import process_products_task
-from Agent.validation import validate_and_trigger_agents
+from agent1_module import ProductDetailAgent
+from Agent2 import Agent2
+from tasks import process_products_task
+from validation import validate_and_trigger_agents
 
 app = FastAPI()
 class LocationRequest(BaseModel):
@@ -15,13 +15,13 @@ class ProductItem(RootModel[Dict[str, str]]):
     pass
 
 class PredictionRequest(BaseModel):
-    order_id: str
+    cart_id: str
     community_id: str
     product_names: List[ProductItem]
 
-def format_response(order_id: str, community_id: str, raw_products: List[dict], order_item_ids: List[str]) -> dict:
+def format_response(cart_id: str, community_id: str, raw_products: List[dict], cart_item_ids: List[str]) -> dict:
     formatted_products = []
-    for product, order_item_id in zip(raw_products, order_item_ids):
+    for product, cart_item_id in zip(raw_products, cart_item_ids):
         # Rename discount_per_kg to subsidy_value if present
         subsidy_value = product.get("discount_per_kg") or product.get("subsidy_value")
         formatted_products.append({
@@ -30,23 +30,23 @@ def format_response(order_id: str, community_id: str, raw_products: List[dict], 
             "subsidy_level": product.get("subsidy_level"),
             "community_id": community_id,
             "subsidy_value": subsidy_value,
-            "order_item_id": order_item_id,
+            "cart_item_id": cart_item_id,
         })
     return {
-        "order_id": order_id,
+        "cart_id": cart_id,
         "products": formatted_products
     }
 
+
 @app.post("/predict")
 def predict(request: PredictionRequest) -> dict:
-    order_item_ids: List[str] = []
-    product_names: List[str] = []
-    for item in request.product_names:
-        order_item_id, product_name_str = list(item.root.items())[0]
-        order_item_ids.append(order_item_id)
-        product_names.append(product_name_str)
-
-    async_result = process_products_task.delay(request.community_id, product_names)
+    async_result = process_products_task.delay(
+        request.cart_id,
+        request.community_id,
+        [p.dict() for p in request.product_names]  # send full dicts
+    )
+    results = async_result.get()  # wait for worker result
+    return results
 
     try:
         results: List[dict] = async_result.get(timeout=300)
@@ -56,7 +56,7 @@ def predict(request: PredictionRequest) -> dict:
     if not results:
         raise HTTPException(status_code=404, detail="No valid results generated.")
 
-    return format_response(request.order_id, request.community_id, results, order_item_ids)
+    return format_response(request.cart_id, request.community_id, results, cart_item_ids)
 
 @app.post("/validate-address/")
 def validate_address_endpoint(payload: LocationRequest):
